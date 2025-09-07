@@ -4,10 +4,50 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 from Model.inter_temporal_embedding import interpolation
+from torch.autograd import Function
+from torch.utils.cpp_extension import load
+import gcn_fusion
+
 
 T=52
 m=450
 Sliding_window = 4
+
+
+
+
+
+class GCNFusion(Function):
+    @staticmethod
+    def forward(ctx, embeddings_Q, embeddings_K, input_x):
+        embeddings_Q = embeddings_Q.contiguous()
+        embeddings_K = embeddings_K.contiguous()
+        input_x = input_x.contiguous()
+        
+
+        Q, K, GCN_Q, GCN_K, x2, embeddings_Q_saved, embeddings_K_saved = gcn_fusion.gcn_fusion_forward(
+            embeddings_Q, embeddings_K, input_x
+        )
+
+        ctx.save_for_backward(GCN_Q, GCN_K, x2, embeddings_Q_saved, embeddings_K_saved)
+
+        return Q, K
+
+    @staticmethod
+    def backward(ctx, grad_Q, grad_K):
+        GCN_Q, GCN_K, x2, embeddings_Q, embeddings_K = ctx.saved_tensors
+
+        grad_embeddings_Q, grad_embeddings_K, grad_input_x = gcn_fusion.gcn_fusion_backward(
+            grad_Q.contiguous(), 
+            grad_K.contiguous(), 
+            GCN_Q, GCN_K, x2, embeddings_Q, embeddings_K
+        )
+
+
+        return grad_embeddings_Q, grad_embeddings_K, grad_input_x
+gcn_fusion_op = GCNFusion.apply
+
+
 class SPM(torch.nn.Module):
 
     def __init__(self,P,C,d):
@@ -77,19 +117,29 @@ class STCM(torch.nn.Module):
         ## city-GCN
         all_base_embedding = self.group_embedding(self.group_index)
         offset_embeddings = self.offset_linear_transform(self.offset_embedding)
+        # print(all_base_embedding.shape, offset_embeddings.shape)
         final_embeddings = all_base_embedding+offset_embeddings
         final_embeddings = F.normalize(final_embeddings , 2, -1)
         final_embeddings = F.relu(final_embeddings)
         embeddings_Q = self.linear_Q(final_embeddings)
         embeddings_K = self.linear_K(final_embeddings)
-        GCN_Q = torch.mm(embeddings_Q,embeddings_Q.T)
-        GCN_K = torch.mm(embeddings_Q,embeddings_Q.T)
-        GCN_Q = F.softmax(GCN_Q,dim=0)
-        GCN_K = F.softmax(GCN_K,dim=0)
         x_shape = x.shape
-        x2 = x.reshape(-1,x.shape[-1])
-        Q = torch.mm(x2,GCN_Q)
-        K = torch.mm(x2,GCN_K)
+        #op1
+        # print(embeddings_Q.shape,embeddings_K.shape,x.shape)
+        # x_shape = x.shape
+        # GCN_Q = torch.mm(embeddings_Q,embeddings_Q.T)
+        # GCN_K = torch.mm(embeddings_K,embeddings_K.T)
+        # GCN_Q = F.softmax(GCN_Q,dim=0)
+        # GCN_K = F.softmax(GCN_K,dim=0)
+        # x_shape = x.shape
+        # x2 = x.reshape(-1,x.shape[-1])
+        # Q = torch.mm(x2,GCN_Q)
+        # K = torch.mm(x2,GCN_K)
+
+
+        Q, K = gcn_fusion_op(embeddings_Q, embeddings_K, x)
+
+
         Q = Q.reshape(*x_shape)
         K = K.reshape(*x_shape)
         Q = self.city_enc(Q).transpose(1,2)
@@ -106,13 +156,14 @@ class STCM(torch.nn.Module):
         # external_embeddings = self.external_factors_projector(self.external_factors(t)*self.external_mask[t].unsqueeze(1))
         # inter_embeddings = inter_embeddings + external_embeddings
         # print(inter_embeddings.shape)
+        # op2
         Q = Q + inter_embeddings
         K = K + inter_embeddings
         attention_score = F.softmax(torch.mm(Q,K.T)/self.d**0.5,dim=1)
-        # print(attention_score.shape)
         V = self.city_enc_V(x).transpose(1,2) ##T,P,C -> T,C,P
         V = self.pos_enc_V(V).transpose(1,2) ## TCP TPC
         V = torch.einsum("ij,jkl->ikl",attention_score,V)+x
+        
         V = self.predictor(self.ffn(V.transpose(0,2))).transpose(0,2)
         res = self.SPM(x,t)
         return V+res
